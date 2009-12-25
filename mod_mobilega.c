@@ -34,6 +34,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include <stdbool.h>
 #include <stdint.h>
 #include <errno.h>
+#include <assert.h>
 
 #include "md5.h"
 
@@ -54,6 +55,8 @@ typedef struct {
 typedef struct {
   PLUGIN_DATA;
 
+  buffer *parse_response;
+
   plugin_config **config_storage;
   plugin_config conf;
 } plugin_data;
@@ -69,7 +72,7 @@ typedef enum {
 
 typedef struct {
   ga_connection_state_t state;
-  //time_t state_timestamp;
+  time_t state_timestamp;
 
   data_mobilega *host;
 
@@ -85,6 +88,14 @@ typedef struct {
   connection *remote_conn;  /* dump pointer */
   plugin_data *plugin_data; /* dump pointer */
 } handler_ctx;
+
+static void handler_ctx_free(handler_ctx *hctx) {
+  buffer_free(hctx->response);
+  buffer_free(hctx->response_header);
+  chunkqueue_free(hctx->wb);
+
+  free(hctx);
+}
 
 INIT_FUNC(mod_mobilega_init) {
   plugin_data *p;
@@ -111,6 +122,84 @@ FREE_FUNC(mod_mobilega_free) {
     free(p->config_storage);
   }
   return HANDLER_GO_ON;
+}
+
+static void ga_connection_close(server *srv, handler_ctx *hctx) {
+  plugin_data *p;
+  connection *con;
+
+  if (NULL == hctx) return;
+
+  p    = hctx->plugin_data;
+  con  = hctx->remote_conn;
+
+  if (hctx->fd != -1) {
+    fdevent_event_del(srv->ev, &(hctx->fde_ndx), hctx->fd);
+    fdevent_unregister(srv->ev, hctx->fd);
+
+    close(hctx->fd);
+    srv->cur_fds--;
+  }
+
+  handler_ctx_free(hctx);
+  con->plugin_ctx[p->id] = NULL;
+}
+
+static int ga_establish_connection(server *srv, handler_ctx *hctx) {
+  struct sockaddr *ga_addr;
+  struct sockaddr_in ga_addr_in;
+#if defined(HAVE_IPV6) && defined(HAVE_INET_PTON)
+  struct sockaddr_in6 ga_addr_in6;
+#endif
+  socklen_t servlen;
+
+  plugin_data *p      = hctx->plugin_data;
+  data_mobilega *host = hctx->host;
+  int ga_fd           = hctx->fd;
+
+
+#if defined(HAVE_IPV6) && defined(HAVE_INET_PTON)
+  if (strstr(host->host->ptr, ":")) {
+    memset(&ga_addr_in6, 0, sizeof(ga_addr_in6));
+    ga_addr_in6.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, host->host->ptr, (char *) &ga_addr_in6.sin6_addr);
+    ga_addr_in6.sin6_port = htons(host->port);
+    servlen = sizeof(ga_addr_in6);
+    ga_addr = (struct sockaddr *) &ga_addr_in6;
+  } else
+#endif
+  {
+    memset(&ga_addr_in, 0, sizeof(ga_addr_in));
+    ga_addr_in.sin_family = AF_INET;
+    ga_addr_in.sin_addr.s_addr = inet_addr(host->host->ptr);
+    ga_addr_in.sin_port = htons(host->port);
+    servlen = sizeof(ga_addr_in);
+    ga_addr = (struct sockaddr *) &ga_addr_in;
+  }
+
+
+  if (-1 == connect(ga_fd, ga_addr, servlen)) {
+    if (errno == EINPROGRESS || errno == EALREADY) {
+      if (p->conf.debug) {
+        log_error_write(srv, __FILE__, __LINE__, "sd",
+            "connect delayed:", ga_fd);
+      }
+
+      return 1;
+    } else {
+
+      log_error_write(srv, __FILE__, __LINE__, "sdsd",
+          "connect failed:", ga_fd, strerror(errno), errno);
+
+      return -1;
+    }
+  }
+  if (p->conf.debug) {
+    log_error_write(srv, __FILE__, __LINE__, "sd",
+        "connect succeeded: ", ga_fd);
+  }
+
+  return 0;
 }
 
 /* handle plugin config and check values */
@@ -198,7 +287,7 @@ socket_open(server *srv, handler_ctx *hctx) {
 
   plugin_data *p          = hctx->plugin_data;
   data_mobilega *host = hctx->host;
-  int proxy_fd            = hctx->fd;
+  int ga_fd            = hctx->fd;
 
   {
     memset(&addr_in, 0, sizeof(addr_in));
@@ -209,22 +298,22 @@ socket_open(server *srv, handler_ctx *hctx) {
     addr = (struct sockaddr *) &addr_in;
   }
 
-  if (-1 == connect(proxy_fd, addr, servlen)) {
+  if (-1 == connect(ga_fd, addr, servlen)) {
     if (errno == EINPROGRESS || errno == EALREADY) {
       if (p->conf.debug) {
         log_error_write(srv, __FILE__, __LINE__, "sd",
-            "adsense connect delayed:", proxy_fd);
+            "adsense connect delayed:", ga_fd);
       }
       return 1;
     } else {
       log_error_write(srv, __FILE__, __LINE__, "sdsd",
-          "adsense connect failed:", proxy_fd, strerror(errno), errno);
+          "adsense connect failed:", ga_fd, strerror(errno), errno);
       return -1;
     }
   }
   if (p->conf.debug) {
     log_error_write(srv, __FILE__, __LINE__, "sd",
-        "adsense connect succeeded: ", proxy_fd);
+        "adsense connect succeeded: ", ga_fd);
   }
 
   return 0;
@@ -495,10 +584,10 @@ ga_track_page_view(handler_ctx *hctx, connection *con)
   BUFFER_APPEND_STRING_CONST(utm_url, "&utmp=");
   buffer_append_string_encoded(utm_url, CONST_BUF_LEN(document_path), ENCODING_REL_URI_PART);
   BUFFER_APPEND_STRING_CONST(utm_url, "&utmac=");
-  buffer_append_buffer(utm_url, account);
+  buffer_append_string_buffer(utm_url, account);
   BUFFER_APPEND_STRING_CONST(utm_url, "&utmcc=__utma%3D999.999.999.999.999.1%3B"
                                       "&utmvid=");
-  buffer_append_buffer(utm_url, visitor_id);
+  buffer_append_string_buffer(utm_url, visitor_id);
   BUFFER_APPEND_STRING_CONST(utm_url, "&utmip=");
 
   // remote_addr
@@ -534,10 +623,235 @@ ga_track_page_view(handler_ctx *hctx, connection *con)
 
   ga_send_request_to_google_analytics(hctx, CONST_BUF_LEN(utm_url), user_agent, (data_string *)array_get_element(con->request.headers, "Accept-Language"));
 
-  ga_write_gif_data();
+  //ga_write_gif_data();
 }
 
 static handler_t ga_handle_fdevent(void *s, void *ctx, int revents);
+
+static int ga_set_state(server *srv, handler_ctx *hctx, ga_connection_state_t state) {
+  hctx->state = state;
+  hctx->state_timestamp = srv->cur_ts;
+
+  return 0;
+}
+
+static void ga_set_header(connection *con, const char *key, const char *value) {
+    data_string *ds_dst;
+
+    if (NULL == (ds_dst = (data_string *)array_get_unused_element(con->request.headers, TYPE_STRING))) {
+          ds_dst = data_string_init();
+    }
+
+    buffer_copy_string(ds_dst->key, key);
+    buffer_copy_string(ds_dst->value, value);
+    array_insert_unique(con->request.headers, (data_unset *)ds_dst);
+}
+
+static void ga_append_header(connection *con, const char *key, const char *value) {
+    data_string *ds_dst;
+
+    if (NULL == (ds_dst = (data_string *)array_get_unused_element(con->request.headers, TYPE_STRING))) {
+          ds_dst = data_string_init();
+    }
+
+    buffer_copy_string(ds_dst->key, key);
+    buffer_append_string(ds_dst->value, value);
+    array_insert_unique(con->request.headers, (data_unset *)ds_dst);
+}
+
+static int ga_create_env(server *srv, handler_ctx *hctx) {
+  size_t i;
+
+  connection *con   = hctx->remote_conn;
+  buffer *b;
+
+  /* build header */
+
+  b = chunkqueue_get_append_buffer(hctx->wb);
+
+  /* request line */
+  buffer_copy_string(b, get_http_method_name(con->request.http_method));
+  buffer_append_string_len(b, CONST_STR_LEN(" "));
+
+  buffer_append_string_buffer(b, con->request.uri);
+  buffer_append_string_len(b, CONST_STR_LEN(" HTTP/1.0\r\n"));
+
+  ga_append_header(con, "X-Forwarded-For", (char *)inet_ntop_cache_get_ip(srv, &(con->dst_addr)));
+  /* http_host is NOT is just a pointer to a buffer
+   * which is NULL if it is not set */
+  if (con->request.http_host &&
+      !buffer_is_empty(con->request.http_host)) {
+    ga_set_header(con, "X-Host", con->request.http_host->ptr);
+  }
+  ga_set_header(con, "X-Forwarded-Proto", con->conf.is_ssl ? "https" : "http");
+
+  /* request header */
+  for (i = 0; i < con->request.headers->used; i++) {
+    data_string *ds;
+
+    ds = (data_string *)con->request.headers->data[i];
+
+    if (ds->value->used && ds->key->used) {
+      if (buffer_is_equal_string(ds->key, CONST_STR_LEN("Connection"))) continue;
+      if (buffer_is_equal_string(ds->key, CONST_STR_LEN("Proxy-Connection"))) continue;
+
+      buffer_append_string_buffer(b, ds->key);
+      buffer_append_string_len(b, CONST_STR_LEN(": "));
+      buffer_append_string_buffer(b, ds->value);
+      buffer_append_string_len(b, CONST_STR_LEN("\r\n"));
+    }
+  }
+
+  buffer_append_string_len(b, CONST_STR_LEN("\r\n"));
+
+  hctx->wb->bytes_in += b->used - 1;
+  /* body */
+
+  if (con->request.content_length) {
+    chunkqueue *req_cq = con->request_content_queue;
+    chunk *req_c;
+    off_t offset;
+
+    /* something to send ? */
+    for (offset = 0, req_c = req_cq->first; offset != req_cq->bytes_in; req_c = req_c->next) {
+      off_t weWant = req_cq->bytes_in - offset;
+      off_t weHave = 0;
+
+      /* we announce toWrite octects
+       * now take all the request_content chunk that we need to fill this request
+       * */
+
+      switch (req_c->type) {
+      case FILE_CHUNK:
+        weHave = req_c->file.length - req_c->offset;
+
+        if (weHave > weWant) weHave = weWant;
+
+        chunkqueue_append_file(hctx->wb, req_c->file.name, req_c->offset, weHave);
+
+        req_c->offset += weHave;
+        req_cq->bytes_out += weHave;
+
+        hctx->wb->bytes_in += weHave;
+
+        break;
+      case MEM_CHUNK:
+        /* append to the buffer */
+        weHave = req_c->mem->used - 1 - req_c->offset;
+
+        if (weHave > weWant) weHave = weWant;
+
+        b = chunkqueue_get_append_buffer(hctx->wb);
+        buffer_append_memory(b, req_c->mem->ptr + req_c->offset, weHave);
+        b->used++; /* add virtual \0 */
+
+        req_c->offset += weHave;
+        req_cq->bytes_out += weHave;
+
+        hctx->wb->bytes_in += weHave;
+
+        break;
+      default:
+        break;
+      }
+
+      offset += weHave;
+    }
+  }
+
+  return 0;
+}
+
+static int ga_response_parse(server *srv, connection *con, plugin_data *p, buffer *in) {
+  char *s, *ns;
+  int http_response_status = -1;
+
+  UNUSED(srv);
+
+  /* \r\n -> \0\0 */
+
+  buffer_copy_string_buffer(p->parse_response, in);
+
+  for (s = p->parse_response->ptr; NULL != (ns = strstr(s, "\r\n")); s = ns + 2) {
+    char *key, *value;
+    int key_len;
+    data_string *ds;
+    int copy_header;
+
+    ns[0] = '\0';
+    ns[1] = '\0';
+
+    if (-1 == http_response_status) {
+      /* The first line of a Response message is the Status-Line */
+
+      for (key=s; *key && *key != ' '; key++);
+
+      if (*key) {
+        http_response_status = (int) strtol(key, NULL, 10);
+        if (http_response_status <= 0) http_response_status = 502;
+      } else {
+        http_response_status = 502;
+      }
+
+      con->http_status = http_response_status;
+      con->parsed_response |= HTTP_STATUS;
+      continue;
+    }
+
+    if (NULL == (value = strchr(s, ':'))) {
+      /* now we expect: "<key>: <value>\n" */
+
+      continue;
+    }
+
+    key = s;
+    key_len = value - key;
+
+    value++;
+    /* strip WS */
+    while (*value == ' ' || *value == '\t') value++;
+
+    copy_header = 1;
+
+    switch(key_len) {
+    case 4:
+      if (0 == strncasecmp(key, "Date", key_len)) {
+        con->parsed_response |= HTTP_DATE;
+      }
+      break;
+    case 8:
+      if (0 == strncasecmp(key, "Location", key_len)) {
+        con->parsed_response |= HTTP_LOCATION;
+      }
+      break;
+    case 10:
+      if (0 == strncasecmp(key, "Connection", key_len)) {
+        copy_header = 0;
+      }
+      break;
+    case 14:
+      if (0 == strncasecmp(key, "Content-Length", key_len)) {
+        con->response.content_length = strtol(value, NULL, 10);
+        con->parsed_response |= HTTP_CONTENT_LENGTH;
+      }
+      break;
+    default:
+      break;
+    }
+
+    if (copy_header) {
+      if (NULL == (ds = (data_string *)array_get_unused_element(con->response.headers, TYPE_STRING))) {
+        ds = data_response_init();
+      }
+      buffer_copy_string_len(ds->key, key, key_len);
+      buffer_copy_string(ds->value, value);
+
+      array_insert_unique(con->response.headers, (data_unset *)ds);
+    }
+  }
+
+  return 0;
+}
 
 static handler_t ga_write_request(server *srv, handler_ctx *hctx) {
   plugin_data *p    = hctx->plugin_data;
@@ -569,9 +883,9 @@ static handler_t ga_write_request(server *srv, handler_ctx *hctx) {
     /* try to finish the connect() */
     if (hctx->state == GA_STATE_INIT) {
       /* first round */
-      switch (proxy_establish_connection(srv, hctx)) {
+      switch (ga_establish_connection(srv, hctx)) {
       case 1:
-        proxy_set_state(srv, hctx, GA_STATE_CONNECT);
+        ga_set_state(srv, hctx, GA_STATE_CONNECT);
 
         /* connection is in progress, wait for an event and call getsockopt() below */
 
@@ -613,12 +927,12 @@ static handler_t ga_write_request(server *srv, handler_ctx *hctx) {
       }
     }
 
-    proxy_set_state(srv, hctx, GA_STATE_PREPARE_WRITE);
+    ga_set_state(srv, hctx, GA_STATE_PREPARE_WRITE);
     /* fall through */
   case GA_STATE_PREPARE_WRITE:
-    proxy_create_env(srv, hctx);
+    ga_create_env(srv, hctx);
 
-    proxy_set_state(srv, hctx, GA_STATE_WRITE);
+    ga_set_state(srv, hctx, GA_STATE_WRITE);
 
     /* fall through */
   case GA_STATE_WRITE:;
@@ -640,7 +954,7 @@ static handler_t ga_write_request(server *srv, handler_ctx *hctx) {
     }
 
     if (hctx->wb->bytes_out == hctx->wb->bytes_in) {
-      proxy_set_state(srv, hctx, GA_STATE_READ);
+      ga_set_state(srv, hctx, GA_STATE_READ);
 
       fdevent_event_del(srv->ev, &(hctx->fde_ndx), hctx->fd);
       fdevent_event_add(srv->ev, &(hctx->fde_ndx), hctx->fd, FDEVENT_IN);
@@ -669,13 +983,13 @@ static int ga_demux_response(server *srv, handler_ctx *hctx) {
 
   plugin_data *p    = hctx->plugin_data;
   connection *con   = hctx->remote_conn;
-  int proxy_fd       = hctx->fd;
+  int ga_fd       = hctx->fd;
 
   /* check how much we have to read */
   if (ioctl(hctx->fd, FIONREAD, &b)) {
     log_error_write(srv, __FILE__, __LINE__, "sd",
         "ioctl failed: ",
-        proxy_fd);
+        ga_fd);
     return -1;
   }
 
@@ -698,7 +1012,7 @@ static int ga_demux_response(server *srv, handler_ctx *hctx) {
       if (errno == EAGAIN) return 0;
       log_error_write(srv, __FILE__, __LINE__, "sds",
           "unexpected end-of-file (perhaps the proxy process died):",
-          proxy_fd, strerror(errno));
+          ga_fd, strerror(errno));
       return -1;
     }
 
@@ -732,7 +1046,8 @@ static int ga_demux_response(server *srv, handler_ctx *hctx) {
         log_error_write(srv, __FILE__, __LINE__, "sb", "Header:", hctx->response_header);
 #endif
         /* parse the response header */
-        proxy_response_parse(srv, con, p, hctx->response_header);
+        /* tasuku: comment out */
+        //ga_response_parse(srv, con, p, hctx->response_header);
 
         /* enable chunked-transfer-encoding */
         if (con->request.http_version == HTTP_VERSION_1_1 &&
@@ -895,7 +1210,7 @@ SUBREQUEST_FUNC(mod_mobilega_handle_subrequest) {
 
   if (con->mode != p->id) return HANDLER_GO_ON;
 
-  switch(proxy_write_request(srv, hctx)) {
+  switch(ga_write_request(srv, hctx)) {
   case HANDLER_ERROR:
     log_error_write(srv, __FILE__, __LINE__,  "sbdd", "proxy-server disabled:",
       host->host,
@@ -906,7 +1221,7 @@ SUBREQUEST_FUNC(mod_mobilega_handle_subrequest) {
     host->is_disabled = 1;
     host->disable_ts = srv->cur_ts;
 
-    proxy_connection_close(srv, hctx);
+    ga_connection_close(srv, hctx);
 
     /* reset the enviroment and restart the sub-request */
     buffer_reset(con->physical.path);
@@ -944,14 +1259,14 @@ static handler_t ga_handle_fdevent(void *s, void *ctx, int revents) {
   if ((revents & FDEVENT_IN) &&
       hctx->state == GA_STATE_READ) {
 
-    switch (proxy_demux_response(srv, hctx)) {
+    switch (ga_demux_response(srv, hctx)) {
     case 0:
       break;
     case 1:
       hctx->host->usage--;
 
       /* we are done */
-      proxy_connection_close(srv, hctx);
+      ga_connection_close(srv, hctx);
 
       joblist_append(srv, con);
       return HANDLER_FINISHED;
@@ -1006,7 +1321,7 @@ static handler_t ga_handle_fdevent(void *s, void *ctx, int revents) {
        *
        */
 
-      proxy_connection_close(srv, hctx);
+      ga_connection_close(srv, hctx);
       joblist_append(srv, con);
 
       con->http_status = 503;
@@ -1017,7 +1332,7 @@ static handler_t ga_handle_fdevent(void *s, void *ctx, int revents) {
 
     con->file_finished = 1;
 
-    proxy_connection_close(srv, hctx);
+    ga_connection_close(srv, hctx);
     joblist_append(srv, con);
   } else if (revents & FDEVENT_ERR) {
     /* kill all connections to the proxy process */
@@ -1025,10 +1340,17 @@ static handler_t ga_handle_fdevent(void *s, void *ctx, int revents) {
     log_error_write(srv, __FILE__, __LINE__, "sd", "proxy-FDEVENT_ERR, but no HUP", revents);
 
     joblist_append(srv, con);
-    proxy_connection_close(srv, hctx);
+    ga_connection_close(srv, hctx);
   }
 
   return HANDLER_FINISHED;
+}
+
+static handler_t mod_mobilega_connection_close_callback(server *srv, connection *con, void *p_d) {
+  plugin_data *p = p_d;
+
+  ga_connection_close(srv, con->plugin_ctx[p->id]);
+  return HANDLER_GO_ON;
 }
 
 int mod_mobilega_plugin_init(plugin *p) {
@@ -1039,9 +1361,8 @@ int mod_mobilega_plugin_init(plugin *p) {
   p->cleanup     = mod_mobilega_free;
   p->set_defaults = mod_mobilega_set_defaults;
 
-  /* TODO: implement!! */
-//  p->connection_reset        = mod_mobilega_connection_close_callback; /* end of req-resp cycle */
-//  p->handle_connection_close = mod_mobilega_connection_close_callback; /* end of client connection */
+  p->connection_reset        = mod_mobilega_connection_close_callback; /* end of req-resp cycle */
+  p->handle_connection_close = mod_mobilega_connection_close_callback; /* end of client connection */
 //  p->handle_uri_clean        = mod_mobilega_check_extension;
   p->handle_subrequest       = mod_mobilega_handle_subrequest;
 //  p->handle_trigger          = mod_mobilega_trigger;
