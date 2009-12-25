@@ -83,11 +83,27 @@ typedef struct {
   int fd; /* fd to the proxy process */
   int fde_ndx; /* index into the fd-event buffer */
 
-  //size_t path_info_offset; /* start of path_info in uri.path */
-
   connection *remote_conn;  /* dump pointer */
   plugin_data *plugin_data; /* dump pointer */
 } handler_ctx;
+
+static handler_ctx * handler_ctx_init() {
+  handler_ctx * hctx;
+
+  hctx = calloc(1, sizeof(*hctx));
+
+  hctx->state = GA_STATE_INIT;
+
+  hctx->response = buffer_init();
+  hctx->response_header = buffer_init();
+
+  hctx->wb = chunkqueue_init();
+
+  hctx->fd = -1;
+  hctx->fde_ndx = -1;
+
+  return hctx;
+}
 
 static void handler_ctx_free(handler_ctx *hctx) {
   buffer_free(hctx->response);
@@ -1194,6 +1210,42 @@ include_mobile_adsense(connection *con)
   }
 }
 
+static handler_t mod_mobilega_handle_uri_clean(server *srv, connection *con, void *p_d) {
+  plugin_data *p = p_d;
+  buffer *fn;
+
+  if (con->mode != DIRECT) return HANDLER_GO_ON;
+
+  /* Possibly, we processed already this request */
+  if (con->file_started == 1) return HANDLER_GO_ON;
+
+  mod_mobilega_patch_connection(srv, con, p);
+
+  fn = con->uri.path;
+
+  if (fn->used == 0) {
+    return HANDLER_ERROR;
+  }
+
+  if (p->conf.debug) {
+    log_error_write(srv, __FILE__, __LINE__,  "s", "mobilega - uri_clean");
+  }
+
+  /* init handler-context */
+  {
+    handler_ctx *hctx = handler_ctx_init();
+
+    hctx->remote_conn      = con;
+    hctx->plugin_data      = p;
+
+    con->plugin_ctx[p->id] = hctx;
+
+    con->mode = p->id;
+  }
+
+  return HANDLER_GO_ON;
+}
+
 SUBREQUEST_FUNC(mod_mobilega_handle_subrequest) {
   plugin_data *p = p_d;
   size_t m;
@@ -1363,7 +1415,7 @@ int mod_mobilega_plugin_init(plugin *p) {
 
   p->connection_reset        = mod_mobilega_connection_close_callback; /* end of req-resp cycle */
   p->handle_connection_close = mod_mobilega_connection_close_callback; /* end of client connection */
-//  p->handle_uri_clean        = mod_mobilega_check_extension;
+  p->handle_uri_clean        = mod_mobilega_handle_uri_clean;
   p->handle_subrequest       = mod_mobilega_handle_subrequest;
 //  p->handle_trigger          = mod_mobilega_trigger;
 
