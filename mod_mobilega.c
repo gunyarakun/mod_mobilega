@@ -39,6 +39,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include "md5.h"
 
 #define data_mobilega data_fastcgi
+#define data_mobilega_init data_fastcgi_init
+
+#define GA_HOST "pagead2.googlesyndication.com"
+#define GA_PORT 80
 
 typedef struct {
   buffer *ad_type;
@@ -57,6 +61,10 @@ typedef struct {
 
   buffer *parse_response;
 
+  data_mobilega *analytics_host;
+  array *get_params;
+  array *cookies;
+
   plugin_config **config_storage;
   plugin_config conf;
 } plugin_data;
@@ -73,8 +81,6 @@ typedef enum {
 typedef struct {
   ga_connection_state_t state;
   time_t state_timestamp;
-
-  data_mobilega *host;
 
   buffer *response;
   buffer *response_header;
@@ -115,9 +121,26 @@ static void handler_ctx_free(handler_ctx *hctx) {
 
 INIT_FUNC(mod_mobilega_init) {
   plugin_data *p;
+  struct hostent *he;
 
+  if (!(he = gethostbyname(GA_HOST))) {
+    return NULL;
+  }
+  if (he->h_addrtype != AF_INET) {
+    return NULL;
+  }
+  if (he->h_length != sizeof(struct in_addr)) {
+    return NULL;
+  }
   if ((p = calloc(1, sizeof(plugin_data)))) {
-    /* TODO: init */
+    struct in_addr ad;
+    ad.s_addr = *(unsigned int *)he->h_addr_list[0];
+    p->analytics_host = data_mobilega_init();
+    /* TODO: save addr */
+    buffer_copy_string(p->analytics_host->host, inet_ntoa(ad));
+    p->analytics_host->port = GA_PORT;
+    p->get_params = array_init();
+    p->cookies = array_init();
     return p;
   }
   return NULL;
@@ -137,6 +160,13 @@ FREE_FUNC(mod_mobilega_free) {
     }
     free(p->config_storage);
   }
+  if (p->cookies) {
+    array_free(p->cookies);
+  }
+  if (p->get_params) {
+    array_free(p->get_params);
+  }
+  free(p);
   return HANDLER_GO_ON;
 }
 
@@ -170,9 +200,8 @@ static int ga_establish_connection(server *srv, handler_ctx *hctx) {
   socklen_t servlen;
 
   plugin_data *p      = hctx->plugin_data;
-  data_mobilega *host = hctx->host;
+  data_mobilega *host = p->analytics_host;
   int ga_fd           = hctx->fd;
-
 
 #if defined(HAVE_IPV6) && defined(HAVE_INET_PTON)
   if (strstr(host->host->ptr, ":")) {
@@ -192,7 +221,6 @@ static int ga_establish_connection(server *srv, handler_ctx *hctx) {
     servlen = sizeof(ga_addr_in);
     ga_addr = (struct sockaddr *) &ga_addr_in;
   }
-
 
   if (-1 == connect(ga_fd, ga_addr, servlen)) {
     if (errno == EINPROGRESS || errno == EALREADY) {
@@ -285,8 +313,6 @@ static int mod_mobilega_patch_connection(server *srv, connection *con, plugin_da
 }
 #undef PATCH
 
-#define GA_HOST "pagead2.googlesyndication.com"
-#define GA_PORT 80
 #define GA_AD_TYPE "text_image"
 #define GA_CHANNEL "4846347906"
 #define GA_CLIENT "ca-mb-pub-6322315354375602"
@@ -294,46 +320,6 @@ static int mod_mobilega_patch_connection(server *srv, connection *con, plugin_da
 #define GA_MARKUP "xhtml"
 #define GA_OE "utf8"
 #define GA_OUTPUT "xhtml"
-
-static int
-socket_open(server *srv, handler_ctx *hctx) {
-  struct sockaddr *addr;
-  struct sockaddr_in addr_in;
-  socklen_t servlen;
-
-  plugin_data *p          = hctx->plugin_data;
-  data_mobilega *host = hctx->host;
-  int ga_fd            = hctx->fd;
-
-  {
-    memset(&addr_in, 0, sizeof(addr_in));
-    addr_in.sin_family = AF_INET;
-    addr_in.sin_addr.s_addr = inet_addr(GA_HOST);
-    addr_in.sin_port = htons(GA_PORT);
-    servlen = sizeof(addr_in);
-    addr = (struct sockaddr *) &addr_in;
-  }
-
-  if (-1 == connect(ga_fd, addr, servlen)) {
-    if (errno == EINPROGRESS || errno == EALREADY) {
-      if (p->conf.debug) {
-        log_error_write(srv, __FILE__, __LINE__, "sd",
-            "adsense connect delayed:", ga_fd);
-      }
-      return 1;
-    } else {
-      log_error_write(srv, __FILE__, __LINE__, "sdsd",
-          "adsense connect failed:", ga_fd, strerror(errno), errno);
-      return -1;
-    }
-  }
-  if (p->conf.debug) {
-    log_error_write(srv, __FILE__, __LINE__, "sd",
-        "adsense connect succeeded: ", ga_fd);
-  }
-
-  return 0;
-}
 
 static void
 ga_send_request_to_google_analytics(handler_ctx *hctx, const char *path, unsigned int path_len, buffer *user_agent, data_string *accept_language)
@@ -445,8 +431,10 @@ static buffer *
 ga_get_visitor_id(buffer *guid, buffer *account, buffer *user_agent, buffer *cookie)
 {
   buffer *message;
-  if (cookie && CONST_BUF_LEN(cookie) != 0) {
-    return buffer_init_buffer(cookie);
+  if (cookie) {
+    if (CONST_BUF_LEN(cookie) != 0) {
+      return buffer_init_buffer(cookie);
+    }
   }
 
   if (!buffer_is_empty(guid)) {
@@ -474,10 +462,10 @@ ga_get_visitor_id(buffer *guid, buffer *account, buffer *user_agent, buffer *coo
 }
 
 static void
-ga_track_page_view(handler_ctx *hctx, connection *con)
+make_google_analytics_request(handler_ctx *hctx, connection *con, plugin_data *p)
 {
   time_t timestamp;
-  array *get_params;
+  array *get_params = p->get_params;
   data_string *ds = NULL;
   buffer *query_str, *domain_name, *document_referer, *document_path, *account,
          *user_agent, *dcmguid, *visitor_id,
@@ -488,11 +476,12 @@ ga_track_page_view(handler_ctx *hctx, connection *con)
 
   server_socket *srv_sock = con->srv_socket;
 
-  buffer_copy_string_buffer(query_str, con->uri.query);
+  query_str = buffer_init_buffer(con->uri.query);
+  array_reset(get_params);
   split_get_params(get_params, query_str);
 
   // timestamp
-  timestamp = time();
+  timestamp = time(NULL);
 
   // domain_name
   domain_name = buffer_init();
@@ -558,7 +547,7 @@ ga_track_page_view(handler_ctx *hctx, connection *con)
 
   // cookie -> visitor_id
   if ((ds = (data_string *)array_get_element(con->request.headers, "Cookie"))) {
-    array *cookies;
+    array *cookies = p->cookies;
     array_reset(cookies);
     parse_cookie(cookies, ds->value);
     if ((ds = (data_string *)array_get_element(cookies, GA_COOKIE_NAME))) {
@@ -934,12 +923,12 @@ static handler_t ga_write_request(server *srv, handler_ctx *hctx) {
       if (socket_error != 0) {
         log_error_write(srv, __FILE__, __LINE__, "ss",
             "establishing connection failed:", strerror(socket_error),
-            "port:", hctx->host->port);
+            "port:", p->analytics_host->port);
 
         return HANDLER_ERROR;
       }
       if (p->conf.debug) {
-        log_error_write(srv, __FILE__, __LINE__,  "s", "proxy - connect - delayed success");
+        log_error_write(srv, __FILE__, __LINE__,  "s", "mobilega - connect - delayed success");
       }
     }
 
@@ -1012,7 +1001,7 @@ static int ga_demux_response(server *srv, handler_ctx *hctx) {
 
   if (p->conf.debug) {
     log_error_write(srv, __FILE__, __LINE__, "sd",
-             "proxy - have to read:", b);
+             "mobilega - have to read:", b);
   }
 
   if (b > 0) {
@@ -1027,7 +1016,7 @@ static int ga_demux_response(server *srv, handler_ctx *hctx) {
     if (-1 == (r = read(hctx->fd, hctx->response->ptr + hctx->response->used - 1, b))) {
       if (errno == EAGAIN) return 0;
       log_error_write(srv, __FILE__, __LINE__, "sds",
-          "unexpected end-of-file (perhaps the proxy process died):",
+          "unexpected end-of-file:",
           ga_fd, strerror(errno));
       return -1;
     }
@@ -1258,13 +1247,15 @@ SUBREQUEST_FUNC(mod_mobilega_handle_subrequest) {
   if (NULL == hctx) return HANDLER_GO_ON;
 
   mod_mobilega_patch_connection(srv, con, p);
-  host = hctx->host;
+  host = p->analytics_host;
 
   if (con->mode != p->id) return HANDLER_GO_ON;
 
+  make_google_analytics_request(hctx, con, p);
+
   switch(ga_write_request(srv, hctx)) {
   case HANDLER_ERROR:
-    log_error_write(srv, __FILE__, __LINE__,  "sbdd", "proxy-server disabled:",
+    log_error_write(srv, __FILE__, __LINE__,  "sbdd", "google-analytics-server disabled:",
       host->host,
       host->port,
       hctx->fd);
@@ -1315,7 +1306,7 @@ static handler_t ga_handle_fdevent(void *s, void *ctx, int revents) {
     case 0:
       break;
     case 1:
-      hctx->host->usage--;
+      p->analytics_host->usage--;
 
       /* we are done */
       ga_connection_close(srv, hctx);
