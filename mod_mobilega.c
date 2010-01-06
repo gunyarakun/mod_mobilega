@@ -22,6 +22,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include "base.h"
 #include "log.h"
 #include "buffer.h"
+#include "stream.h"
 #include "plugin.h"
 
 #include "fdevent.h"
@@ -35,14 +36,34 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include <stdint.h>
 #include <errno.h>
 #include <assert.h>
+#ifdef HAVE_PCRE_H
+#include <pcre.h>
+#endif
+
+ /* debug */ #include <stdio.h>
 
 #include "md5.h"
 
 #define data_mobilega data_fastcgi
 #define data_mobilega_init data_fastcgi_init
 
-#define GA_HOST "pagead2.googlesyndication.com"
-#define GA_PORT 80
+#define GAN_HOST                    "www.google-analytics.com"
+#define GAN_PORT                    80
+#define GAN_VERSION                 "4.4sh"
+#define GAN_COOKIE_NAME             "__utmmobile"
+#define GAN_COOKIE_PATH             "/"
+#define GAN_COOKIE_USER_PERSISTENCE 63072000
+#define GAN_UTM_GIF_PATH            "/__utm.gif"
+
+#define GAD_HOST    "pagead2.googlesyndication.com"
+#define GAD_PORT    80
+#define GAD_AD_TYPE "text_image"
+#define GAD_CHANNEL "4846347906"
+#define GAD_CLIENT  "ca-mb-pub-6322315354375602"
+#define GAD_FORMAT  "mobile_single"
+#define GAD_MARKUP  "xhtml"
+#define GAD_OE      "utf8"
+#define GAD_OUTPUT  "xhtml"
 
 typedef struct {
   buffer *ad_type;
@@ -64,6 +85,10 @@ typedef struct {
   data_mobilega *analytics_host;
   array *get_params;
   array *cookies;
+
+#ifdef HAVE_PCRE_H
+  pcre *analytics_regex;
+#endif
 
   plugin_config **config_storage;
   plugin_config conf;
@@ -123,7 +148,8 @@ INIT_FUNC(mod_mobilega_init) {
   plugin_data *p;
   struct hostent *he;
 
-  if (!(he = gethostbyname(GA_HOST))) {
+  /* TODO: re-query host ip address */
+  if (!(he = gethostbyname(GAN_HOST))) {
     return NULL;
   }
   if (he->h_addrtype != AF_INET) {
@@ -138,7 +164,7 @@ INIT_FUNC(mod_mobilega_init) {
     p->analytics_host = data_mobilega_init();
     /* TODO: save addr */
     buffer_copy_string(p->analytics_host->host, inet_ntoa(ad));
-    p->analytics_host->port = GA_PORT;
+    p->analytics_host->port = GAN_PORT;
     p->get_params = array_init();
     p->cookies = array_init();
     return p;
@@ -166,6 +192,11 @@ FREE_FUNC(mod_mobilega_free) {
   if (p->get_params) {
     array_free(p->get_params);
   }
+#ifdef HAVE_PCRE_H
+  if (p->analytics_regex) {
+    pcre_free(p->analytics_regex);
+  }
+#endif
   free(p);
   return HANDLER_GO_ON;
 }
@@ -250,6 +281,10 @@ static int ga_establish_connection(server *srv, handler_ctx *hctx) {
 SETDEFAULTS_FUNC(mod_mobilega_set_defaults) {
   plugin_data *p = p_d;
   size_t i = 0;
+#ifdef HAVE_PCRE_H
+  const char *errptr;
+  int erroff;
+#endif
 
   // FIXME:
   config_values_t cv[] = {
@@ -279,6 +314,19 @@ SETDEFAULTS_FUNC(mod_mobilega_set_defaults) {
     }
 */
   }
+#ifdef HAVE_PCRE_H
+  /* allow 2 params */
+  if (NULL == (p->analytics_regex = pcre_compile("<!--#(mobile_analytics|mobile_adsense)\\s+(?:([a-z]+)=\"(.*?)(?<!\\\\)\"\\s*)?(?:([a-z]+)=\"(.*?)(?<!\\\\)\"\\s*)?-->", 0, &errptr, &erroff, NULL))) {
+    log_error_write(srv, __FILE__, __LINE__, "sds",
+      "mod_mobilega: pcre ",
+      erroff, errptr);
+    return HANDLER_ERROR;
+  }
+#else
+  log_error_write(srv, __FILE__, __LINE__, "s",
+    "mod_mobilega: pcre support is missing, please recompile with pcre support or remove mod_mobilega from the list of modules");
+  return HANDLER_ERROR;
+#endif
   return HANDLER_GO_ON;
 }
 
@@ -313,27 +361,27 @@ static int mod_mobilega_patch_connection(server *srv, connection *con, plugin_da
 }
 #undef PATCH
 
-#define GA_AD_TYPE "text_image"
-#define GA_CHANNEL "4846347906"
-#define GA_CLIENT "ca-mb-pub-6322315354375602"
-#define GA_FORMAT "mobile_single"
-#define GA_MARKUP "xhtml"
-#define GA_OE "utf8"
-#define GA_OUTPUT "xhtml"
 
 static void
 ga_send_request_to_google_analytics(handler_ctx *hctx, const char *path, unsigned int path_len, buffer *user_agent, data_string *accept_language)
 {
   buffer *r = chunkqueue_get_append_buffer(hctx->wb);
 
-  BUFFER_COPY_STRING_CONST(r, "GET /__utm.gif HTTP/1.0");
+  BUFFER_COPY_STRING_CONST(r, "GET ");
+  buffer_append_string_len(r, path, path_len);
+  BUFFER_APPEND_STRING_CONST(r, " HTTP/1.0");
   if (accept_language) {
-    BUFFER_COPY_STRING_CONST(r, "\r\nAccepts-Language: ");
+    BUFFER_APPEND_STRING_CONST(r, "\r\nAccepts-Language: ");
     buffer_append_string_buffer(r, accept_language->value);
   }
   BUFFER_APPEND_STRING_CONST(r, "\r\nUser-Agent: ");
   buffer_append_string_buffer(r, user_agent);
   BUFFER_APPEND_STRING_CONST(r, "\r\n\r\n");
+
+  if (false) {
+    /* for debug */
+    fprintf(stderr, "req: %.*s\n", r->used - 1, r->ptr);
+  }
 
   hctx->wb->bytes_in += r->used - 1;
 }
@@ -421,11 +469,6 @@ parse_cookie(array *cookies, buffer *cbuf) {
   }
   return 0;
 }
-
-#define GA_VERSION                 "4.4sh"
-#define GA_COOKIE_NAME             "__utmmobile"
-#define GA_COOKIE_PATH             "/"
-#define GA_COOKIE_USER_PERSISTENCE 63072000
 
 static buffer *
 ga_get_visitor_id(buffer *guid, buffer *account, buffer *user_agent, buffer *cookie)
@@ -550,7 +593,7 @@ make_google_analytics_request(handler_ctx *hctx, connection *con, plugin_data *p
     array *cookies = p->cookies;
     array_reset(cookies);
     parse_cookie(cookies, ds->value);
-    if ((ds = (data_string *)array_get_element(cookies, GA_COOKIE_NAME))) {
+    if ((ds = (data_string *)array_get_element(cookies, GAN_COOKIE_NAME))) {
       visitor_id = ga_get_visitor_id(dcmguid, account, user_agent, ds->value);
     } else {
       visitor_id = ga_get_visitor_id(dcmguid, account, user_agent, NULL);
@@ -564,21 +607,20 @@ make_google_analytics_request(handler_ctx *hctx, connection *con, plugin_data *p
     ds = data_response_init();
   }
   BUFFER_COPY_STRING_CONST(ds->key, "Set-Cookie");
-  BUFFER_COPY_STRING_CONST(ds->value, GA_COOKIE_NAME);
+  BUFFER_COPY_STRING_CONST(ds->value, GAN_COOKIE_NAME);
   BUFFER_APPEND_STRING_CONST(ds->value, "=");
 
   buffer_append_string_buffer(ds->value, visitor_id);
-  BUFFER_APPEND_STRING_CONST(ds->value, "; Path=" GA_COOKIE_PATH);
+  BUFFER_APPEND_STRING_CONST(ds->value, "; Path=" GAN_COOKIE_PATH);
   buffer_append_string_len(ds->value, CONST_STR_LEN("; Version=1"));
 
   buffer_append_string_len(ds->value, CONST_STR_LEN("; max-age="));
-  buffer_append_long(ds->value, GA_COOKIE_USER_PERSISTENCE);
+  buffer_append_long(ds->value, GAN_COOKIE_USER_PERSISTENCE);
 
   array_insert_unique(con->response.headers, (data_unset *)ds);
 
   // Construct the gif hit url.
-#define GA_UTM_GIF_LOCATION "TODO"
-  utm_url = buffer_init_string(GA_UTM_GIF_LOCATION "?"
+  utm_url = buffer_init_string(GAN_UTM_GIF_PATH "?"
                                "utmwv=" VERSION
                                "&utmn=");
   buffer_append_long(utm_url, random() % 0x7fffffff);
@@ -628,7 +670,15 @@ make_google_analytics_request(handler_ctx *hctx, connection *con, plugin_data *p
 
   ga_send_request_to_google_analytics(hctx, CONST_BUF_LEN(utm_url), user_agent, (data_string *)array_get_element(con->request.headers, "Accept-Language"));
 
-  //ga_write_gif_data();
+  buffer_free(query_str);
+  buffer_free(domain_name);
+  buffer_free(document_referer);
+  buffer_free(document_path);
+  buffer_free(account);
+  buffer_free(user_agent);
+  buffer_free(dcmguid);
+  buffer_free(visitor_id);
+  buffer_free(utm_url);
 }
 
 static handler_t ga_handle_fdevent(void *s, void *ctx, int revents);
@@ -662,109 +712,6 @@ static void ga_append_header(connection *con, const char *key, const char *value
     buffer_copy_string(ds_dst->key, key);
     buffer_append_string(ds_dst->value, value);
     array_insert_unique(con->request.headers, (data_unset *)ds_dst);
-}
-
-static int ga_create_env(server *srv, handler_ctx *hctx) {
-  size_t i;
-
-  connection *con   = hctx->remote_conn;
-  buffer *b;
-
-  /* build header */
-
-  b = chunkqueue_get_append_buffer(hctx->wb);
-
-  /* request line */
-  buffer_copy_string(b, get_http_method_name(con->request.http_method));
-  buffer_append_string_len(b, CONST_STR_LEN(" "));
-
-  buffer_append_string_buffer(b, con->request.uri);
-  buffer_append_string_len(b, CONST_STR_LEN(" HTTP/1.0\r\n"));
-
-  ga_append_header(con, "X-Forwarded-For", (char *)inet_ntop_cache_get_ip(srv, &(con->dst_addr)));
-  /* http_host is NOT is just a pointer to a buffer
-   * which is NULL if it is not set */
-  if (con->request.http_host &&
-      !buffer_is_empty(con->request.http_host)) {
-    ga_set_header(con, "X-Host", con->request.http_host->ptr);
-  }
-  ga_set_header(con, "X-Forwarded-Proto", con->conf.is_ssl ? "https" : "http");
-
-  /* request header */
-  for (i = 0; i < con->request.headers->used; i++) {
-    data_string *ds;
-
-    ds = (data_string *)con->request.headers->data[i];
-
-    if (ds->value->used && ds->key->used) {
-      if (buffer_is_equal_string(ds->key, CONST_STR_LEN("Connection"))) continue;
-      if (buffer_is_equal_string(ds->key, CONST_STR_LEN("Proxy-Connection"))) continue;
-
-      buffer_append_string_buffer(b, ds->key);
-      buffer_append_string_len(b, CONST_STR_LEN(": "));
-      buffer_append_string_buffer(b, ds->value);
-      buffer_append_string_len(b, CONST_STR_LEN("\r\n"));
-    }
-  }
-
-  buffer_append_string_len(b, CONST_STR_LEN("\r\n"));
-
-  hctx->wb->bytes_in += b->used - 1;
-  /* body */
-
-  if (con->request.content_length) {
-    chunkqueue *req_cq = con->request_content_queue;
-    chunk *req_c;
-    off_t offset;
-
-    /* something to send ? */
-    for (offset = 0, req_c = req_cq->first; offset != req_cq->bytes_in; req_c = req_c->next) {
-      off_t weWant = req_cq->bytes_in - offset;
-      off_t weHave = 0;
-
-      /* we announce toWrite octects
-       * now take all the request_content chunk that we need to fill this request
-       * */
-
-      switch (req_c->type) {
-      case FILE_CHUNK:
-        weHave = req_c->file.length - req_c->offset;
-
-        if (weHave > weWant) weHave = weWant;
-
-        chunkqueue_append_file(hctx->wb, req_c->file.name, req_c->offset, weHave);
-
-        req_c->offset += weHave;
-        req_cq->bytes_out += weHave;
-
-        hctx->wb->bytes_in += weHave;
-
-        break;
-      case MEM_CHUNK:
-        /* append to the buffer */
-        weHave = req_c->mem->used - 1 - req_c->offset;
-
-        if (weHave > weWant) weHave = weWant;
-
-        b = chunkqueue_get_append_buffer(hctx->wb);
-        buffer_append_memory(b, req_c->mem->ptr + req_c->offset, weHave);
-        b->used++; /* add virtual \0 */
-
-        req_c->offset += weHave;
-        req_cq->bytes_out += weHave;
-
-        hctx->wb->bytes_in += weHave;
-
-        break;
-      default:
-        break;
-      }
-
-      offset += weHave;
-    }
-  }
-
-  return 0;
 }
 
 static int ga_response_parse(server *srv, connection *con, plugin_data *p, buffer *in) {
@@ -935,8 +882,7 @@ static handler_t ga_write_request(server *srv, handler_ctx *hctx) {
     ga_set_state(srv, hctx, GA_STATE_PREPARE_WRITE);
     /* fall through */
   case GA_STATE_PREPARE_WRITE:
-    ga_create_env(srv, hctx);
-
+    make_google_analytics_request(hctx, con, p);
     ga_set_state(srv, hctx, GA_STATE_WRITE);
 
     /* fall through */
@@ -1092,13 +1038,13 @@ include_mobile_adsense(connection *con)
   data_string *ds = NULL;
   buffer *url;
   url = buffer_init_string("/pagead/ads?"
-    "ad_type=" GA_AD_TYPE
-    "&channel=" GA_CHANNEL
-    "&client=" GA_CLIENT
-    "&format=" GA_FORMAT
-    "&markup=" GA_MARKUP
-    "&oe=" GA_OE
-    "&output=" GA_OUTPUT);
+    "ad_type=" GAD_AD_TYPE
+    "&channel=" GAD_CHANNEL
+    "&client=" GAD_CLIENT
+    "&format=" GAD_FORMAT
+    "&markup=" GAD_MARKUP
+    "&oe=" GAD_OE
+    "&output=" GAD_OUTPUT);
 
   /* set dt */
   {
@@ -1199,6 +1145,8 @@ include_mobile_adsense(connection *con)
   }
 }
 
+#define GAN_PIXEL "/ga.gif"
+
 static handler_t mod_mobilega_handle_uri_clean(server *srv, connection *con, void *p_d) {
   plugin_data *p = p_d;
   buffer *fn;
@@ -1220,8 +1168,8 @@ static handler_t mod_mobilega_handle_uri_clean(server *srv, connection *con, voi
     log_error_write(srv, __FILE__, __LINE__,  "s", "mobilega - uri_clean");
   }
 
-  /* init handler-context */
-  {
+  /* if mobile_analytics, init handler-context */
+  if (buffer_is_equal_string(con->uri.path, CONST_STR_LEN(GAN_PIXEL))) {
     handler_ctx *hctx = handler_ctx_init();
 
     hctx->remote_conn      = con;
@@ -1233,6 +1181,132 @@ static handler_t mod_mobilega_handle_uri_clean(server *srv, connection *con, voi
   }
 
   return HANDLER_GO_ON;
+}
+
+static int process_mobileanalytics_stmt(server *srv, connection *con, plugin_data *p,
+          const char **l, size_t n) {
+  buffer *b, *url;
+  data_string *ds;
+  url = buffer_init_string(GAN_PIXEL "?utmac=");
+  buffer_append_string(url, l[3]);
+  buffer_append_string_len(url, CONST_STR_LEN("&utmn="));
+  buffer_append_long(url, random() & 0x7fffffff);
+  if ((ds = (data_string *)array_get_element(con->request.headers, "Referer")) &&
+      !buffer_is_empty(ds->value)) {
+    buffer_append_string_len(url, CONST_STR_LEN("&utmr="));
+    buffer_append_string_buffer(url, ds->value);
+  } else {
+    buffer_append_string_len(url, CONST_STR_LEN("&utmr=-"));
+  }
+  if (!buffer_is_empty(con->request.orig_uri)) {
+    buffer_append_string_len(url, CONST_STR_LEN("&utmp="));
+    buffer_append_string_encoded(url, CONST_BUF_LEN(con->request.orig_uri), ENCODING_REL_URI_PART);
+  }
+  buffer_append_string_len(url, CONST_STR_LEN("&guid=ON"));
+
+  b = chunkqueue_get_append_buffer(con->write_queue);
+  BUFFER_COPY_STRING_CONST(b, "<img src=\"");
+  buffer_append_string_encoded(b, CONST_BUF_LEN(url), ENCODING_HTML);
+  BUFFER_APPEND_STRING_CONST(b, "\" />");
+
+  return 0;
+}
+
+static int mod_mobilega_handle_request(server *srv, connection *con, plugin_data *p) {
+  stream s;
+#ifdef  HAVE_PCRE_H
+  int i, n;
+
+#define N 10
+  int ovec[N * 3];
+#endif
+
+  /* get a stream to the file */
+  if (-1 == stream_open(&s, con->physical.path)) {
+    log_error_write(srv, __FILE__, __LINE__, "sb",
+        "stream-open: ", con->physical.path);
+    return -1;
+  }
+
+
+  /**
+   * <!--#element attribute=value attribute=value ... -->
+   *
+   */
+#ifdef HAVE_PCRE_H
+  for (i = 0; (n = pcre_exec(p->analytics_regex, NULL, s.start, s.size, i, 0, ovec, N * 3)) > 0; i = ovec[1]) {
+    const char **l;
+    /* take everything from last offset to current match pos */
+
+    chunkqueue_append_file(con->write_queue, con->physical.path, i, ovec[0] - i);
+    pcre_get_substring_list(s.start, ovec, n, &l);
+    /* TODO: dispatch analytics/adsense with l[1] */
+    process_mobileanalytics_stmt(srv, con, p, l, n);
+    pcre_free_substring_list(l);
+  }
+
+  switch(n) {
+  case PCRE_ERROR_NOMATCH:
+    /* copy everything/the rest */
+    chunkqueue_append_file(con->write_queue, con->physical.path, i, s.size - i);
+
+    break;
+  default:
+    log_error_write(srv, __FILE__, __LINE__, "sd",
+        "execution error while matching: ", n);
+    break;
+  }
+#endif
+
+  stream_close(&s);
+
+  con->file_started  = 1;
+  con->file_finished = 1;
+  con->mode = p->id;
+
+  // TODO: remove this logic
+  response_header_overwrite(srv, con, CONST_STR_LEN("Content-Type"), CONST_STR_LEN("application/xhtml+xml; charset=UTF-8"));
+
+  {
+    /* Generate "ETag" & "Last-Modified" headers */
+
+    stat_cache_entry *sce = NULL;
+    buffer *mtime = NULL;
+
+    stat_cache_get_entry(srv, con, con->physical.path, &sce);
+
+    etag_mutate(con->physical.etag, sce->etag);
+    response_header_overwrite(srv, con, CONST_STR_LEN("ETag"), CONST_BUF_LEN(con->physical.etag));
+
+    mtime = (buffer *)strftime_cache_get(srv, sce->st.st_mtime);
+    response_header_overwrite(srv, con, CONST_STR_LEN("Last-Modified"), CONST_BUF_LEN(mtime));
+  }
+
+  /* reset physical.path */
+  buffer_reset(con->physical.path);
+
+  return 0;
+}
+
+URIHANDLER_FUNC(mod_mobilega_physical_path) {
+  plugin_data *p = p_d;
+  size_t k;
+
+  if (con->mode != DIRECT) return HANDLER_GO_ON;
+
+  if (con->physical.path->used == 0) return HANDLER_GO_ON;
+
+  /* Possibly, we processed already this request */
+  if (con->file_started == 1) return HANDLER_GO_ON;
+
+  mod_mobilega_patch_connection(srv, con, p);
+
+  if (mod_mobilega_handle_request(srv, con, p)) {
+    /* on error */
+    con->http_status = 500;
+    con->mode = DIRECT;
+  }
+  return HANDLER_FINISHED;
 }
 
 SUBREQUEST_FUNC(mod_mobilega_handle_subrequest) {
@@ -1250,8 +1324,6 @@ SUBREQUEST_FUNC(mod_mobilega_handle_subrequest) {
   host = p->analytics_host;
 
   if (con->mode != p->id) return HANDLER_GO_ON;
-
-  make_google_analytics_request(hctx, con, p);
 
   switch(ga_write_request(srv, hctx)) {
   case HANDLER_ERROR:
@@ -1407,6 +1479,7 @@ int mod_mobilega_plugin_init(plugin *p) {
   p->connection_reset        = mod_mobilega_connection_close_callback; /* end of req-resp cycle */
   p->handle_connection_close = mod_mobilega_connection_close_callback; /* end of client connection */
   p->handle_uri_clean        = mod_mobilega_handle_uri_clean;
+  p->handle_subrequest_start = mod_mobilega_physical_path;
   p->handle_subrequest       = mod_mobilega_handle_subrequest;
 //  p->handle_trigger          = mod_mobilega_trigger;
 
